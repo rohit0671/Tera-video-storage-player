@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>TeraBox Player</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+    #player { display: none; width: 100%; height: 100%; background: #000; }
+    #status { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; color: #d7d7d7; font: 16px/1.45 -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif; text-align: center; }
+    #spinner { width: 26px; height: 26px; border: 3px solid #444; border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
+    #retry { display: none; border: 0; border-radius: 10px; padding: 11px 18px; background: #fff; color: #111; font: inherit; cursor: pointer; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <video id="player" controls playsinline webkit-playsinline preload="metadata"></video>
+  <div id="status"><div id="spinner"></div><div id="statusText">Loading video…</div><button id="retry" type="button">Try again</button></div>
+
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script>
+    (function () {
+      // Set this to the HTTPS URL of the new bot backend, without a trailing slash.
+      var BACKEND_URL = 'https://YOUR-APP.justrunmy.app';
+      // Keep false until an ad provider is connected in showAd().
+      var AD_ENABLED = false;
+
+      var video = document.getElementById('player');
+      var statusBox = document.getElementById('status');
+      var statusText = document.getElementById('statusText');
+      var spinner = document.getElementById('spinner');
+      var retryButton = document.getElementById('retry');
+      var tg = window.Telegram && window.Telegram.WebApp;
+      var hlsPlayer = null;
+      var shareId = '';
+      var initData = '';
+      var refreshUsed = false;
+      var countedView = false;
+
+      if (tg) {
+        try { tg.ready(); tg.expand(); } catch (ignore) {}
+      }
+
+      function setStatus(message, canRetry) {
+        video.style.display = 'none';
+        statusBox.style.display = 'flex';
+        statusText.textContent = message;
+        spinner.style.display = canRetry ? 'none' : 'block';
+        retryButton.style.display = canRetry ? 'inline-block' : 'none';
+      }
+
+      function readShareId() {
+        var telegramId = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param;
+        var queryId = new URLSearchParams(window.location.search).get('id');
+        return telegramId || queryId || '';
+      }
+
+      function failText(result) {
+        if (result && result.status === 401) return 'Telegram session expired. Reopen the video from Telegram.';
+        if (result && result.status === 404) return 'This video is no longer available.';
+        if (result && result.status === 429) return 'Too many requests. Please wait a minute and try again.';
+        return 'Video is temporarily unavailable.';
+      }
+
+      function callApi(path, extra) {
+        var payload = { id: shareId, initData: initData };
+        Object.keys(extra || {}).forEach(function (key) { payload[key] = extra[key]; });
+        return fetch(BACKEND_URL + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          cache: 'no-store'
+        }).then(function (response) {
+          return response.json().catch(function () { return {}; }).then(function (body) {
+            return { status: response.status, body: body };
+          });
+        });
+      }
+
+      function loadScript(src) {
+        return new Promise(function (resolve) {
+          var tag = document.createElement('script');
+          tag.src = src;
+          tag.onload = function () { resolve(true); };
+          tag.onerror = function () { resolve(false); };
+          document.head.appendChild(tag);
+        });
+      }
+
+      function attach(url) {
+        var isHls = /\.m3u8(?:\?|$)/i.test(url);
+        if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+        video.removeAttribute('src');
+        video.load();
+        if (isHls && !video.canPlayType('application/vnd.apple.mpegurl')) {
+          return loadScript('https://cdn.jsdelivr.net/npm/hls.js@1').then(function (loaded) {
+            if (!loaded || !window.Hls || !window.Hls.isSupported()) throw new Error('HLS playback is not supported');
+            hlsPlayer = new window.Hls({ enableWorker: true });
+            hlsPlayer.loadSource(url);
+            hlsPlayer.attachMedia(video);
+            return new Promise(function (resolve, reject) {
+              hlsPlayer.once(window.Hls.Events.MANIFEST_PARSED, resolve);
+              hlsPlayer.once(window.Hls.Events.ERROR, function (_event, data) {
+                if (data && data.fatal) reject(new Error('HLS stream failed'));
+              });
+            });
+          });
+        }
+        video.src = url;
+        return new Promise(function (resolve) {
+          video.addEventListener('loadedmetadata', resolve, { once: true });
+          setTimeout(resolve, 8000);
+        });
+      }
+
+      function playInfo(info) {
+        if (!info || !info.stream_url) throw new Error('Missing stream URL');
+        if (info.thumbnail) video.poster = info.thumbnail;
+        if (info.name) document.title = info.name;
+        return attach(info.stream_url).then(function () {
+          statusBox.style.display = 'none';
+          video.style.display = 'block';
+          var attempt = video.play();
+          if (attempt && attempt.catch) attempt.catch(function () {});
+        });
+      }
+
+      function showAd() {
+        // Connect an ad provider here. Resolve when the ad is complete or unavailable.
+        return Promise.resolve();
+      }
+
+      function loadVideo() {
+        setStatus('Loading video…', false);
+        refreshUsed = false;
+        countedView = false;
+        return callApi('/api/prepare', {}).then(function (prepared) {
+          if (!prepared.body || !prepared.body.ok) throw prepared;
+          return (AD_ENABLED && !prepared.body.admin ? showAd() : Promise.resolve());
+        }).then(function () {
+          return callApi('/api/stream', {});
+        }).then(function (result) {
+          if (!result.body || !result.body.ok) throw result;
+          return playInfo(result.body);
+        }).catch(function (error) {
+          setStatus(failText(error), true);
+        });
+      }
+
+      video.addEventListener('playing', function () {
+        if (countedView) return;
+        countedView = true;
+        callApi('/api/played', {}).catch(function () {});
+      });
+
+      video.addEventListener('error', function () {
+        if (refreshUsed) { setStatus('Video is unavailable.', true); return; }
+        refreshUsed = true;
+        setStatus('Refreshing the video link…', false);
+        callApi('/api/stream', { refresh: true }).then(function (result) {
+          if (!result.body || !result.body.ok) throw result;
+          return playInfo(result.body);
+        }).catch(function (error) { setStatus(failText(error), true); });
+      });
+
+      retryButton.addEventListener('click', loadVideo);
+      shareId = readShareId();
+      initData = (tg && tg.initData) || '';
+      if (!/^[A-Za-z0-9_-]{6,64}$/.test(shareId) || !initData) {
+        setStatus('Open this video from Telegram.', false);
+        spinner.style.display = 'none';
+        return;
+      }
+      if (!BACKEND_URL || BACKEND_URL.indexOf('YOUR-APP') !== -1) {
+        setStatus('Mini App backend is not configured.', false);
+        spinner.style.display = 'none';
+        return;
+      }
+      loadVideo();
+    })();
+  </script>
+</body>
+</html>
